@@ -11,7 +11,7 @@ This is the repository of ChCore Lab.
 
 - `make qemu`: Start a QEMU instance to run ChCore
 
-## Debug with GBD
+## Debug with GDB
 
 - `make qemu-gdb`: Start a QEMU instance with GDB server
 - `make gdb`: Start a GDB (gdb-multiarch) client
