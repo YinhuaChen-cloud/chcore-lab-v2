@@ -1,6 +1,8 @@
 # ChCore Lab
 
-This is the repository of ChCore Lab.
+**2023.10: 新版本课程实验+配套视频讲解，请访问[这里](https://github.com/SJTU-IPADS/OS-Course-Lab).**
+
+This is the repository of ChCore Lab-V2.
 
 ## Build
 
