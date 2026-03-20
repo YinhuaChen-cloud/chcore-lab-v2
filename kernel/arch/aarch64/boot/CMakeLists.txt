@@ -1,7 +1,13 @@
 # Add bootloader source files
 add_subdirectory(${CHCORE_PLAT})
 message(STATUS "init_objects: ${init_objects}")
-string(REGEX REPLACE ";" "\n" init_objects "${init_objects}")
+
+set(init_objects_ld "")
+foreach(obj ${init_objects})
+    string(APPEND init_objects_ld
+           "        ${obj}(.text* .rodata* .data* .bss* COMMON)\n")
+endforeach()
+set(init_objects "${init_objects_ld}")
 
 # Prepare and set linker script
 configure_file(linker.tpl.ld linker.ld.S)

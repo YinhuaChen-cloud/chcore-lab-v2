@@ -12,7 +12,6 @@ cscope.*
 /build
 _build
 _install
-.vscode
 simulate.sh
 debug.sh
 .config

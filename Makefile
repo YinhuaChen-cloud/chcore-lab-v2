@@ -32,9 +32,11 @@ distclean:
 .PHONY: qemu qemu-gdb gdb
 
 qemu:
+	@echo "booting qemu"
 	$(V)$(_QEMU) $(QEMU_OPTS)
 
-qemu-gdb:
+qemu-gdb: build
+	@echo "booting qemu-gdb"
 	$(V)$(_QEMU) -S -gdb tcp::$(QEMU_GDB_PORT) $(QEMU_OPTS)
 
 gdb:

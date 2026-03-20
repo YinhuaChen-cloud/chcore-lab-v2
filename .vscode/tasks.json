@@ -1,0 +1,27 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Setup QEMU",
+            "type": "shell",
+            "isBackground": true,
+            "command": "bash ${workspaceFolder}/.vscode/start-qemu-gdb.sh",
+            "problemMatcher": {
+                "pattern": {
+                    "regexp": ".+"
+                },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "^\\[QEMU\\] Waiting for GDB Connection$",
+                    "endsPattern": "^\\[QEMU\\] Waiting for GDB Connection$"
+                }
+            }
+        },
+        {
+            "label": "Stop QEMU",
+            "type": "shell",
+            "command": "bash ${workspaceFolder}/.vscode/stop-qemu-gdb.sh",
+            "problemMatcher": []
+        }
+    ]
+}
