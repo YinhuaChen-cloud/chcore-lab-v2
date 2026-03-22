@@ -210,6 +210,12 @@ void free_page_table(void *pgtbl)
 /*
  * Translate a va to pa, and get its pte for the flags
  */
+// pgtbl: the page table to query
+// va: the virtual address to translate
+// pa: output the translated physical address
+// entry: output the pte entry for the va, which can be used to get/set
+// return val: 0 on success, -ENOMAPPING if the va is not mapped
+// NOTE: This function only supports querying L3 page, 4KB granularity. 
 int query_in_pgtbl(void *pgtbl, vaddr_t va, paddr_t *pa, pte_t **entry)
 {
         /* LAB 2 TODO 3 BEGIN */
@@ -218,10 +224,57 @@ int query_in_pgtbl(void *pgtbl, vaddr_t va, paddr_t *pa, pte_t **entry)
          * return the pa and pte until a L0/L1 block or page, return
          * `-ENOMAPPING` if the va is not mapped.
          */
+        ptp_t *l0_ptp = (ptp_t *)pgtbl;
+        ptp_t *l1_ptp, *l2_ptp, *l3_ptp, *next_ptp;
+        pte_t *pte;
+        int ret;
 
+        /* L0 -> L1 */
+        ret = get_next_ptp(l0_ptp, 0, va, &l1_ptp, &pte, false);
+        if (ret < 0) {
+                BUG_ON(ret != -ENOMAPPING);
+                return ret;
+        }
+
+        /* L1 -> L2, check for 1GB block */
+        ret = get_next_ptp(l1_ptp, 1, va, &l2_ptp, &pte, false);
+        if (ret < 0) {
+                BUG_ON(ret != -ENOMAPPING);
+                return ret;
+        }
+
+        /* L2 -> L3, check for 2MB block */
+        ret = get_next_ptp(l2_ptp, 2, va, &l3_ptp, &pte, false);
+        if (ret < 0) {
+                BUG_ON(ret != -ENOMAPPING);
+                return ret;
+        }
+
+        /* L3 page */
+        ret = get_next_ptp(l3_ptp, 3, va, &next_ptp, &pte, false);
+        if (ret < 0) {
+                BUG_ON(ret != -ENOMAPPING);
+                return ret;
+        }
+
+        BUG_ON(pa == NULL);
+        *pa = ((paddr_t)pte->l3_page.pfn << PAGE_SHIFT) | GET_VA_OFFSET_L3(va);
+        if (entry)
+                *entry = pte;
+        return 0;
         /* LAB 2 TODO 3 END */
 }
 
+// pgtbl: the page table to map
+// va: the start virtual address to map, should be page-aligned
+// pa: the start physical address to map, should be page-aligned
+// len: the length to map, should be a multiple of page size
+// flags: the vmr_prop_t flags for the mapping, such as VMR_READ, VMR_WRITE, VMR_EXEC, etc.
+// return val: 
+//      0 on success, 
+//      -EINVAL on invalid arguments (e.g., unaligned va/pa/len, or len is 0),
+//      -ENOMAPPING if failed to map the range (e.g., failed to allocate page table page when needed).
+// NOTE: This function only supports mapping L3 page, 4KB granularity.
 int map_range_in_pgtbl(void *pgtbl, vaddr_t va, paddr_t pa, size_t len,
                        vmr_prop_t flags)
 {
@@ -233,9 +286,45 @@ int map_range_in_pgtbl(void *pgtbl, vaddr_t va, paddr_t pa, size_t len,
          * mapped.
          */
 
+        vaddr_t va_end = va + len;
+        ptp_t *l0_ptp = (ptp_t *)pgtbl;
+        ptp_t *l1_ptp, *l2_ptp, *l3_ptp, *next_ptp;
+        pte_t *pte;
+        int ret;
+
+        while (va < va_end) {
+                /* Walk L0->L1->L2->L3, allocating page table pages as needed */
+                ret = get_next_ptp(l0_ptp, 0, va, &l1_ptp, &pte, true);
+                BUG_ON(ret < 0);
+                ret = get_next_ptp(l1_ptp, 1, va, &l2_ptp, &pte, true);
+                BUG_ON(ret < 0);
+                ret = get_next_ptp(l2_ptp, 2, va, &l3_ptp, &pte, true);
+                BUG_ON(ret < 0);
+                ret = get_next_ptp(l3_ptp, 3, va, &next_ptp, &pte, true);
+                BUG_ON(ret < 0);
+
+                /* Fill in the L3 PTE */
+                pte->pte = 0;
+                pte->l3_page.is_valid = 1;
+                pte->l3_page.is_page = 1;
+                pte->l3_page.pfn = pa >> PAGE_SHIFT;
+                set_pte_flags(pte, flags, USER_PTE);
+
+                va += PAGE_SIZE;
+                pa += PAGE_SIZE;
+        }
+        return 0;
         /* LAB 2 TODO 3 END */
 }
 
+// pgtbl: the page table to unmap
+// va: the start virtual address to unmap, should be page-aligned
+// len: the length to unmap, should be a multiple of page size
+// return val:
+//      0 on success,
+//      -EINVAL on invalid arguments (e.g., unaligned va/len, or len is 0),
+//      -ENOMAPPING if failed to unmap the range (e.g., the va is not mapped).
+// NOTE: This function only supports unmapping L3 page, 4KB granularity.
 int unmap_range_in_pgtbl(void *pgtbl, vaddr_t va, size_t len)
 {
         /* LAB 2 TODO 3 BEGIN */
@@ -245,6 +334,29 @@ int unmap_range_in_pgtbl(void *pgtbl, vaddr_t va, size_t len)
          * unmapped.
          */
 
+        vaddr_t va_end = va + len;
+        ptp_t *l0_ptp = (ptp_t *)pgtbl;
+        ptp_t *l1_ptp, *l2_ptp, *l3_ptp, *next_ptp;
+        pte_t *pte;
+        int ret;
+
+        while (va < va_end) {
+                /* Walk L0->L1->L2->L3, no allocation */
+                ret = get_next_ptp(l0_ptp, 0, va, &l1_ptp, &pte, false);
+                if (ret < 0) { va += PAGE_SIZE; continue; }
+                ret = get_next_ptp(l1_ptp, 1, va, &l2_ptp, &pte, false);
+                if (ret < 0) { va += PAGE_SIZE; continue; }
+                ret = get_next_ptp(l2_ptp, 2, va, &l3_ptp, &pte, false);
+                if (ret < 0) { va += PAGE_SIZE; continue; }
+                ret = get_next_ptp(l3_ptp, 3, va, &next_ptp, &pte, false);
+                if (ret < 0) { va += PAGE_SIZE; continue; }
+
+                /* Invalidate the L3 PTE */
+                pte->pte = PTE_DESCRIPTOR_INVALID;
+
+                va += PAGE_SIZE;
+        }
+        return 0;
         /* LAB 2 TODO 3 END */
 }
 
