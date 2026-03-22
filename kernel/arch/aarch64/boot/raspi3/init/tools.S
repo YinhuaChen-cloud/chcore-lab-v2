@@ -57,7 +57,9 @@
 
 BEGIN_FUNC(arm64_elX_to_el1)
 	/* LAB 1 TODO 1 BEGIN */
-
+	/* 提取EL字段 */
+	mrs x9, CurrentEL
+	and x9, x9, #0xC  
 	/* LAB 1 TODO 1 END */
 
 	// Check the current exception level.
@@ -75,7 +77,15 @@ BEGIN_FUNC(arm64_elX_to_el1)
 
 	// Set the return address and exception level.
 	/* LAB 1 TODO 2 BEGIN */
-
+	// elr_el3 的正确设置应使得控制流在 eret 后从 
+	// arm64_elX_to_el1 返回到 _start 继续执行初始化。 
+	// spsr_el3 的正确设置应正确屏蔽 DAIF 四类中断，
+	// 并且将 SP 正确设置为 EL1h. 在设置好这两个系统
+	// 寄存器后，不需要立即 eret.
+	adr x9, .Ltarget
+	msr elr_el3, x9
+	mov x9, SPSR_ELX_DAIF | SPSR_ELX_EL1H
+	msr spsr_el3, x9
 	/* LAB 1 TODO 2 END */
 
 .Lin_el2:
@@ -249,7 +259,8 @@ BEGIN_FUNC(el1_mmu_activate)
 	mrs     x8, sctlr_el1
 	/* Enable MMU */
 	/* LAB 1 TODO 4 BEGIN */
-
+	/* M 位就是 MMU 开关 */
+	orr     x8, x8, #SCTLR_EL1_M
 	/* LAB 1 TODO 4 END */
 	/* Disable alignment checking */
 	bic     x8, x8, #SCTLR_EL1_A
