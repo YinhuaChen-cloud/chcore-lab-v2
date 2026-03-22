@@ -17,7 +17,7 @@ list(APPEND _compile_options -Wall)
 
 # Generic compile settings
 list(APPEND _compile_definitions)
-list(APPEND _compile_options -nostdinc -ffreestanding -fPIC)
+list(APPEND _compile_options -nostdinc -ffreestanding -fPIC -fno-common)
 list(APPEND _asm_compile_definitions __ASM__)
 list(APPEND _asm_compile_options)
 list(APPEND _c_compile_definitions)
