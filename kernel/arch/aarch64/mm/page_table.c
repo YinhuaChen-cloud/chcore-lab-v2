@@ -121,6 +121,15 @@ static int get_next_ptp(ptp_t *cur_ptp, u32 level, vaddr_t va, ptp_t **next_ptp,
         }
 
         entry = &(cur_ptp->ent[index]);
+
+        /* Level 3: entry IS the final PTE, no next page table to navigate */
+        if (level == 3) {
+                *pte = entry;
+                if (IS_PTE_INVALID(entry->pte))
+                        return -ENOMAPPING;
+                return BLOCK_PTP;
+        }
+
         if (IS_PTE_INVALID(entry->pte)) {
                 if (alloc == false) {
                         return -ENOMAPPING;
@@ -207,6 +216,11 @@ void free_page_table(void *pgtbl)
         free_pages(l0_ptp);
 }
 
+#define L1_BLOCK_SHIFT (30)
+#define L1_BLOCK_SIZE (1UL << L1_BLOCK_SHIFT)
+#define L2_BLOCK_SHIFT (21)
+#define L2_BLOCK_SIZE (1UL << L2_BLOCK_SHIFT)
+
 /*
  * Translate a va to pa, and get its pte for the flags
  */
@@ -231,27 +245,48 @@ int query_in_pgtbl(void *pgtbl, vaddr_t va, paddr_t *pa, pte_t **entry)
 
         /* L0 -> L1 */
         ret = get_next_ptp(l0_ptp, 0, va, &l1_ptp, &pte, false);
+        BUG_ON(ret != -ENOMAPPING && ret != BLOCK_PTP && ret != NORMAL_PTP);
         if (ret < 0) {
-                BUG_ON(ret != -ENOMAPPING);
                 return ret;
         }
 
         /* L1 -> L2, check for 1GB block */
         ret = get_next_ptp(l1_ptp, 1, va, &l2_ptp, &pte, false);
+        BUG_ON(ret != -ENOMAPPING && ret != BLOCK_PTP && ret != NORMAL_PTP);
         if (ret < 0) {
                 BUG_ON(ret != -ENOMAPPING);
                 return ret;
+        }
+        if (ret == BLOCK_PTP) {
+                /* 1GB L1 block */
+                BUG_ON(pa == NULL);
+                *pa = ((paddr_t)pte->l1_block.pfn << L1_BLOCK_SHIFT)
+                      | GET_VA_OFFSET_L1(va);
+                if (entry)
+                        *entry = pte;
+                return 0;
         }
 
         /* L2 -> L3, check for 2MB block */
         ret = get_next_ptp(l2_ptp, 2, va, &l3_ptp, &pte, false);
+        BUG_ON(ret != -ENOMAPPING && ret != BLOCK_PTP && ret != NORMAL_PTP);
         if (ret < 0) {
                 BUG_ON(ret != -ENOMAPPING);
                 return ret;
         }
+        if (ret == BLOCK_PTP) {
+                /* 2MB L2 block */
+                BUG_ON(pa == NULL);
+                *pa = ((paddr_t)pte->l2_block.pfn << L2_BLOCK_SHIFT)
+                      | GET_VA_OFFSET_L2(va);
+                if (entry)
+                        *entry = pte;
+                return 0;
+        }
 
         /* L3 page */
         ret = get_next_ptp(l3_ptp, 3, va, &next_ptp, &pte, false);
+        BUG_ON(ret != -ENOMAPPING && ret != BLOCK_PTP);
         if (ret < 0) {
                 BUG_ON(ret != -ENOMAPPING);
                 return ret;
@@ -288,7 +323,7 @@ int map_range_in_pgtbl(void *pgtbl, vaddr_t va, paddr_t pa, size_t len,
 
         vaddr_t va_end = va + len;
         ptp_t *l0_ptp = (ptp_t *)pgtbl;
-        ptp_t *l1_ptp, *l2_ptp, *l3_ptp, *next_ptp;
+        ptp_t *l1_ptp, *l2_ptp, *l3_ptp;
         pte_t *pte;
         int ret;
 
@@ -300,8 +335,9 @@ int map_range_in_pgtbl(void *pgtbl, vaddr_t va, paddr_t pa, size_t len,
                 BUG_ON(ret < 0);
                 ret = get_next_ptp(l2_ptp, 2, va, &l3_ptp, &pte, true);
                 BUG_ON(ret < 0);
-                ret = get_next_ptp(l3_ptp, 3, va, &next_ptp, &pte, true);
-                BUG_ON(ret < 0);
+                ret = get_next_ptp(l3_ptp, 3, va, NULL, &pte, false);
+                BUG_ON(ret != -ENOMAPPING && ret != BLOCK_PTP);
+                /* ret may be -ENOMAPPING (entry not yet filled), that's fine */
 
                 /* Fill in the L3 PTE */
                 pte->pte = 0;
@@ -350,6 +386,7 @@ int unmap_range_in_pgtbl(void *pgtbl, vaddr_t va, size_t len)
                 if (ret < 0) { va += PAGE_SIZE; continue; }
                 ret = get_next_ptp(l3_ptp, 3, va, &next_ptp, &pte, false);
                 if (ret < 0) { va += PAGE_SIZE; continue; }
+                BUG_ON(ret != BLOCK_PTP);
 
                 /* Invalidate the L3 PTE */
                 pte->pte = PTE_DESCRIPTOR_INVALID;
@@ -364,14 +401,109 @@ int map_range_in_pgtbl_huge(void *pgtbl, vaddr_t va, paddr_t pa, size_t len,
                             vmr_prop_t flags)
 {
         /* LAB 2 TODO 4 BEGIN */
+        vaddr_t va_end = va + len;
+        ptp_t *l0_ptp = (ptp_t *)pgtbl;
+        ptp_t *l1_ptp, *l2_ptp, *l3_ptp, *next_ptp;
+        pte_t *pte;
+        int ret;
 
+        while (va < va_end) {
+                /* Walk L0 -> L1 ptp (always needed) */
+                ret = get_next_ptp(l0_ptp, 0, va, &l1_ptp, &pte, true);
+                BUG_ON(ret < 0);
+
+                /* Try 1GB L1 block */
+                if ((va & (L1_BLOCK_SIZE - 1)) == 0
+                    && (pa & (L1_BLOCK_SIZE - 1)) == 0
+                    && (va_end - va) >= L1_BLOCK_SIZE) {
+                        pte = &l1_ptp->ent[GET_L1_INDEX(va)];
+                        pte->pte = 0;
+                        pte->l1_block.is_valid = 1;
+                        pte->l1_block.is_table = 0;
+                        pte->l1_block.pfn = pa >> L1_BLOCK_SHIFT;
+                        set_pte_flags(pte, flags, USER_PTE);
+                        va += L1_BLOCK_SIZE;
+                        pa += L1_BLOCK_SIZE;
+                        continue;
+                }
+
+                /* Walk L1 -> L2 ptp */
+                ret = get_next_ptp(l1_ptp, 1, va, &l2_ptp, &pte, true);
+                BUG_ON(ret < 0);
+
+                /* Try 2MB L2 block */
+                if ((va & (L2_BLOCK_SIZE - 1)) == 0
+                    && (pa & (L2_BLOCK_SIZE - 1)) == 0
+                    && (va_end - va) >= L2_BLOCK_SIZE) {
+                        pte = &l2_ptp->ent[GET_L2_INDEX(va)];
+                        pte->pte = 0;
+                        pte->l2_block.is_valid = 1;
+                        pte->l2_block.is_table = 0;
+                        pte->l2_block.pfn = pa >> L2_BLOCK_SHIFT;
+                        set_pte_flags(pte, flags, USER_PTE);
+                        va += L2_BLOCK_SIZE;
+                        pa += L2_BLOCK_SIZE;
+                        continue;
+                }
+
+                /* Fall back to 4KB L3 page */
+                ret = get_next_ptp(l2_ptp, 2, va, &l3_ptp, &pte, true);
+                BUG_ON(ret < 0);
+                ret = get_next_ptp(l3_ptp, 3, va, NULL, &pte, false);
+                /* ret may be -ENOMAPPING (entry not yet filled), that's fine */
+                BUG_ON(ret != -ENOMAPPING && ret != BLOCK_PTP);
+                /* Fill in the L3 PTE */
+                pte->pte = 0;
+                pte->l3_page.is_valid = 1;
+                pte->l3_page.is_page = 1;
+                pte->l3_page.pfn = pa >> PAGE_SHIFT;
+                set_pte_flags(pte, flags, USER_PTE);
+                va += PAGE_SIZE;
+                pa += PAGE_SIZE;
+        }
+        return 0;
         /* LAB 2 TODO 4 END */
 }
 
 int unmap_range_in_pgtbl_huge(void *pgtbl, vaddr_t va, size_t len)
 {
         /* LAB 2 TODO 4 BEGIN */
+        vaddr_t va_end = va + len;
+        ptp_t *l0_ptp = (ptp_t *)pgtbl;
+        ptp_t *l1_ptp, *l2_ptp, *l3_ptp, *next_ptp;
+        pte_t *pte;
+        int ret;
 
+        while (va < va_end) {
+                ret = get_next_ptp(l0_ptp, 0, va, &l1_ptp, &pte, false);
+                if (ret < 0) { va += PAGE_SIZE; continue; }
+
+                ret = get_next_ptp(l1_ptp, 1, va, &l2_ptp, &pte, false);
+                if (ret < 0) { va += PAGE_SIZE; continue; }
+                if (ret == BLOCK_PTP) {
+                        /* 1GB block */
+                        pte->pte = PTE_DESCRIPTOR_INVALID;
+                        va += L1_BLOCK_SIZE;
+                        continue;
+                }
+
+                ret = get_next_ptp(l2_ptp, 2, va, &l3_ptp, &pte, false);
+                if (ret < 0) { va += PAGE_SIZE; continue; }
+                if (ret == BLOCK_PTP) {
+                        /* 2MB block */
+                        pte->pte = PTE_DESCRIPTOR_INVALID;
+                        va += L2_BLOCK_SIZE;
+                        continue;
+                }
+
+                /* Fall back to 4KB L3 page */
+                ret = get_next_ptp(l3_ptp, 3, va, NULL, &pte, false);
+                BUG_ON(ret != -ENOMAPPING && ret != BLOCK_PTP);
+                if (ret == -ENOMAPPING) { va += PAGE_SIZE; continue; }
+                pte->pte = PTE_DESCRIPTOR_INVALID;
+                va += PAGE_SIZE;
+        }
+        return 0;
         /* LAB 2 TODO 4 END */
 }
 
