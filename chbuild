@@ -45,6 +45,12 @@ _echo_err() {
     echo -e "${RED}${BOLD}$@${NONE}"
 }
 
+# defconfig 流程：
+# 1) 若 build 目录已存在则直接报错退出（要求先 clean，避免旧缓存污染默认配置）
+# 2) 选择平台参数：未传参时默认 raspi3，传参则使用用户输入的平台
+# 3) 将 scripts/build/default.config 复制为 .config
+# 4) 执行 _config_default（cmake -B build -C LoadConfigDefault.cmake）
+# 5) 执行 _sync_config_with_cache，把 CMake 缓存值回写同步到 .config
 defconfig() {
     if [ -d $cmake_build_dir ]; then
         _echo_err "There exists a build directory, please run \`$clean_command\` first"
@@ -58,8 +64,11 @@ defconfig() {
     fi
 
     _echo_info "Generating default config file..."
+    # cp scripts/build/default.config .config 
     cp $defconfig_file $config_file
+    # cmake -B $cmake_build_dir -C $cmake_init_cache_default
     _config_default
+    # cmake -N -B $cmake_build_dir -C $cmake_init_cache_dump >/dev/null
     _sync_config_with_cache
     _echo_succ "Default config written to \`$config_file\` file."
 }
@@ -106,16 +115,21 @@ menuconfig() {
 }
 
 build() {
+    # 检查 .config 是否存在 
     _check_config_file
+    # 根据当前 .config 重新跑一遍 CMake 配置阶段
     _config_ask
+    # 把 CMake 缓存中的配置值同步回 .config
     _sync_config_with_cache
     _echo_succ "Config syned to \`$config_file\` file."
 
     _echo_info "Building..."
+    # 真正编译
     cmake --build $cmake_build_dir --target all --parallel $(nproc)
     _echo_succ "Succeeded to build all targets"
 }
 
+# 清除大部分构建产物
 clean() {
     _echo_info "Cleaning..."
 
@@ -132,11 +146,17 @@ clean() {
     fi
 }
 
+# rebuild 流程：
+# 1) 先执行 clean，清理现有构建产物（若存在 CMakeCache，则走 clean-all 后删除 build）
+# 2) 再执行 build，build 内部会检查 .config、按需配置 CMake、同步配置并并行编译 all
+# 3) 因为脚本开头 set -e，任一步失败都会立即中止，后续步骤不再执行
 rebuild() {
     clean
     build
 }
 
+# 1.执行 clean 命令
+# 2.删除 .config 配置文件
 distclean() {
     clean
     _echo_info "Removing config file..."
@@ -145,6 +165,7 @@ distclean() {
     _echo_succ "Succeeded to distclean"
 }
 
+# 打印帮助信息
 _print_help() {
     echo -e "\
 ${BOLD}USAGE:${NONE}
@@ -178,44 +199,65 @@ _docker_run() {
         # we are already in docker container
         $@
     else
+        # test -t 1: 只有在终端环境（tty）中才加 -t 参数，
+        # 否则在 CI 等非交互式环境中会因为没有 tty 而报错
+        # 在 Docker 容器里执行 chbuild，但实际读写的是 host 当前目录
+        # 关键点是这句：
+        #     -v $(pwd):/chos -w /chos 
         test -t 1 && use_tty="-t"
         docker run -i $use_tty --rm \
             -u $(id -u ${USER}):$(id -g ${USER}) \
             -v $(pwd):/chos -w /chos \
             ipads/chcore_builder:v1.3 \
             $self $@
+            # self = ./chbuild
+            # $@ = defconfig/rebuild 
     fi
 }
 
 _main() {
     run_in_docker=true
+    # $# 是 Bash 里的位置参数个数
     while [ $# -gt 0 ]; do
         case $1 in
         help | --help | -h)
             _print_help
             exit
             ;;
+        # --local 想起作用，必须放在命令前面，例如 `./chbuild --local defconfig`
+        # 而 `./chbuild defconfig --local` 是无效的。
         --local | -l)
             run_in_docker=false
+            # ;; : 跳转到 esac 后面继续执行
             ;;
+        # 匹配 -x, --foo, -abc 这类选项
         -*)
             _echo_err "$self: invalid option \`$1\`\n"
             break
             ;;
+        # 匹配所有其它情况
         *)
             if [[ "$1" == "_"* || $(type -t "$1") != function ]]; then
                 _echo_err "$self: invalid command \`$1\`\n"
                 break
             fi
 
+            # 命令分发：例如 defconfig/rebuild，默认在 Docker 中执行；
+            # 传 --local/-l 时改为本机直接执行对应同名函数。
             if [[ $run_in_docker == true ]]; then
+                # _docker_run defconfig
+                # _docker_run rebuild
+                # 默认情况一般使用 docker 执行 defconfig/rebuild
                 _docker_run $@
             else
+                # defconfig
+                # rebuild
                 $@
             fi
             exit
             ;;
         esac
+        # shift 在 Bash 里是“丢掉当前第一个参数，并把后面的参数整体前移一位”。
         shift
     done
 
@@ -224,4 +266,6 @@ _main() {
     exit 1
 }
 
+# _main defconfig
+# _main rebuild
 _main $@
