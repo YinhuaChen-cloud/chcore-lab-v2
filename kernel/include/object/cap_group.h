@@ -112,7 +112,7 @@ struct cap_group *create_root_cap_group(char *, size_t);
  */
 #define ROOT_PCID (1)
 
-struct cap_group *root_cap_group;
+extern struct cap_group *root_cap_group;
 
 /* Syscalls */
 int sys_create_cap_group(u64 pid, u64 cap_group_name, u64 name_len, u64 pcid);

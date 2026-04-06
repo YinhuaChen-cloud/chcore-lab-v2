@@ -20,6 +20,8 @@
 #include <mm/uaccess.h>
 #include <lib/printk.h>
 
+struct cap_group *root_cap_group;
+
 /* tool functions */
 static bool is_valid_slot_id(struct slot_table *slot_table, int slot_id)
 {
