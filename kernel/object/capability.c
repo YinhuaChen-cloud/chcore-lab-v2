@@ -37,16 +37,21 @@ const obj_deinit_func obj_deinit_tbl[TYPE_NR] = {
  * initialize the obj;
  * cap_alloc(obj);
  */
+// type: object type
+// size: the size of the actual data of the object (not including the metadata)
+// retval: the pointer to the actual data of the object (i.e., the opaque field)
 void *obj_alloc(u64 type, u64 size)
 {
         u64 total_size;
         struct object *object;
 
+        // 总大小 = 对象元数据大小 + 对象实际数据大小
         total_size = sizeof(*object) + size;
+        // 申请内存，大小为 total_size，并且将内存初始化为 0
         object = kzalloc(total_size);
         if (!object)
                 return NULL;
-
+        // 初始化对象的元数据
         object->type = type;
         object->size = size;
         object->refcount = 0;
@@ -55,8 +60,10 @@ void *obj_alloc(u64 type, u64 size)
          * If the cap of the object is copied, then the copied cap (slot) is
          * stored in such a list.
          */
+        // 初始化能力链表 (capability list) 为空
         init_list_head(&object->copies_head);
 
+        // opaque 是指向对象实际数据的起始地址
         return object->opaque;
 }
 

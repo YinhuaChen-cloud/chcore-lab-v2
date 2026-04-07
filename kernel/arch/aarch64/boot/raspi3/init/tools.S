@@ -55,6 +55,13 @@
 #define ICH_HCR_EL2             S3_4_C12_C11_0
 #define ICC_SRE_EL2             S3_4_C12_C9_5
 
+/* 不同的机器，上电时可能有不同的EL，读取 CurrentEL 后针对性设置 */
+/* arm64_elX_to_el1: 根据上电时不同的 EL 进行不同的初始化，然后降权限，返回调用方 */
+/* 若是 EL3: 设置EL2为64位，开启 HVC 指令，屏蔽四类中断 */
+/* 			 设置 eret 跳转的地址和 ELx 层级，随后直接执行 EL2 分支 */
+/* 若是 EL2: 关闭 EL1 计时器中断，同时关闭 EL2 的一些功能，屏蔽中断 */
+/* 			 设置 eret 跳转的地址和 ELx 层级，随后执行 eret */
+/* 若是 EL1: 直接 ret */
 BEGIN_FUNC(arm64_elX_to_el1)
 	/* LAB 1 TODO 1 BEGIN */
 	/* 提取EL字段 */

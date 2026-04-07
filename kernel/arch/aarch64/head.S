@@ -16,11 +16,13 @@
 /* Args in x0 (boot_flag) should be passed to main */
 BEGIN_FUNC(start_kernel)
 
+    /* 修改了 sp，之后基本也不打算返回调用 start_kernel 的 caller 了 */
     /* Set the kernel stack at high vaddr */
     ldr     x2, =kernel_stack
     add     x2, x2, KERNEL_STACK_SIZE
     mov     sp, x2
 
+    /* 把 x0 的值存进栈里，就能放心 bl 进其它函数里了 */
     /* Save x0 */
     str     x0, [sp, #-8]!
 
@@ -44,11 +46,13 @@ BEGIN_FUNC(start_kernel)
      * set the TPIDR_EL1 to 0, which represent the logical
      * cpuid in the kernel 
      */
+    /* TPIDR_EL1 用来干啥都行，但一般用来存 CPU_ID */
     mov     x3, #0
     msr     TPIDR_EL1, x3
 
     /* Restore x0 */
     ldr     x0, [sp], #8
 
+    /* 进入main，参数1是 secondary_boot_flag */
     bl      main
 END_FUNC(start_kernel)

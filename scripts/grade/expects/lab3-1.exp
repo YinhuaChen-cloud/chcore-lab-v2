@@ -1,21 +1,42 @@
 #!/usr/bin/expect -f
 
+# 统一的输出函数：所有评分信息都以前缀 "GRADE:" 打印，
+# 方便外部脚本或自动评测系统稳定匹配结果。
 proc print {msg} {
     puts "GRADE: $msg"
     flush stdout
 }
 
+# expect 的全局超时时间，单位为秒。
+# 如果在 10 秒内没有匹配到任何期待的输出，就会进入 timeout 分支并结束评分。
 set timeout 10
+
+# 关闭 spawn 进程的原始输出回显。
+# 这样终端不会被 QEMU 的大量输出刷屏，只保留评分脚本自身的结果。
 log_user 0
 
+# 启动被测环境。
+# 这里通过 `make qemu` 拉起 QEMU，并让 expect 挂接到该进程的标准输入/输出，
+# 从而能够持续读取内核打印并进行模式匹配。
 spawn bash -c "make qemu"
+
+# 记录 QEMU 对应的进程号，便于评分结束后强制杀掉，
+# 避免测试脚本退出后 QEMU 仍然在后台运行。
 set qemu_pid [exp_pid -i $spawn_id]
 
+# 评分表。
+# 每一项的结构都是：{测试名称 当前得分 满分}
+# 初始得分均为 0，匹配到对应输出后再把当前得分更新为满分。
 set scores {
     {"Cap create pretest" 0 10}
     {"Bad instruction 1"  0 10}
 }
 
+# 汇总评分并退出。
+# 1. 遍历所有测试项，逐项打印该项得分；
+# 2. 计算总分；
+# 3. 杀死 QEMU 子进程；
+# 4. 以总分作为脚本退出码退出，供外部评分系统读取。
 proc grade {} {
     global scores
     set score 0
@@ -30,25 +51,46 @@ proc grade {} {
     exit $score
 }
 
+# 注册 SIGINT（通常来自 Ctrl+C）信号处理逻辑。
+# 如果评分过程中用户手动中断，也会先走 `grade`，
+# 保证已获得的分数被正确输出，同时清理 QEMU 进程。
 trap {
     grade
 } SIGINT
 
+# 主匹配循环。
+# expect 会持续监听 QEMU 输出，并按照下面的模式依次尝试匹配：
+# - 匹配到某项测试成功标志后，给该项记满分；
+# - 使用 `exp_continue -continue_timer` 继续等待后续输出，且不重置超时计时器；
+# - 如果检测到 BUG 或超时，则立即结束评分。
 expect {
+    # 用例 1：能力对象创建相关的预检查通过。
+    # 匹配到这条输出后，将第 0 项的当前得分设置为其满分 10 分。
     "Cap_create Pretest Ok!" {
         lset scores {0 1} [lindex $scores {0 2}]
         exp_continue -continue_timer
     }
+
+    # 用例 2：触发预期中的非法指令异常。
+    # 这里检查异常类型和 ESR 是否与实验要求一致；若一致，则第 1 项满分。
     "Exception type: 8, ESR: 0x2000000" {
         lset scores {1 1} [lindex $scores {1 2}]
         exp_continue -continue_timer
     }
+
+    # 如果 QEMU/内核输出中出现 BUG，说明系统进入错误状态，
+    # 直接停止等待并立即结算当前已获得的分数。
     "BUG:" {
         grade
     }
+
+    # 超时分支：在 timeout 秒内没有再观察到任何有效输出，
+    # 认为本轮测试结束，按当前累计结果评分。
     timeout {
         grade
     }
 }
 
+# 如果 expect 正常走到末尾（理论上较少发生），
+# 也执行一次评分与清理，确保脚本总能以统一方式结束。
 grade

@@ -60,6 +60,7 @@ void *kmalloc(size_t size)
         return get_pages(order);
 }
 
+// kmalloc with zero initialization
 void *kzalloc(size_t size)
 {
         void *ptr;
