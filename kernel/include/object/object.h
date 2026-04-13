@@ -33,6 +33,12 @@ struct object {
         u64 opaque[];
 };
 
+// Capability 机制下，所有内核资源（如线程、内存对象等）都被抽象为 object 对象，
+// 并且通过 capability 来访问这些对象。每个 object 都有一个 type 字段来标识它的
+// 类型（如线程、内存对象等），以及一个 size 字段来标识它的大小。object 还包含
+// 一个 refcount 字段来记录有多少 capability 指向它，以及一个 copies_head 链表来
+// 记录所有指向它的 capability。
+// 注：cap_group 也是一种 object，它代表一个进程的能力空间，包含了该进程拥有的所有 capability。
 enum object_type {
         TYPE_CAP_GROUP = 0,
         TYPE_THREAD,

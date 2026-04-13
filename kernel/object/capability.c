@@ -89,6 +89,7 @@ int cap_alloc(struct cap_group *cap_group, void *obj, u64 rights)
         struct object_slot *slot;
         int r, slot_id;
 
+        // container_of: 已知一个成员地址，倒推出它属于哪个结构体对象
         object = container_of(obj, struct object, opaque);
 
         slot_id = alloc_slot_id(cap_group);

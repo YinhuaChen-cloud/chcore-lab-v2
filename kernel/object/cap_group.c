@@ -298,28 +298,27 @@ out_fail:
 }
 
 /* This is for creating the first (init) user process. */
-
 struct cap_group *create_root_cap_group(char *name, size_t name_len)
 {
         struct cap_group *cap_group;
         struct vmspace *vmspace;
         int slot_id;
         /* LAB 3 TODO BEGIN */
-
+        cap_group = obj_alloc(TYPE_CAP_GROUP, sizeof(struct cap_group));
         /* LAB 3 TODO END */
         BUG_ON(!cap_group);
         /* LAB 3 TODO BEGIN */
-
+        slot_id = CAP_GROUP_OBJ_ID;
         /* LAB 3 TODO END */
         BUG_ON(slot_id != CAP_GROUP_OBJ_ID);
         /* LAB 3 TODO BEGIN */
-
+        vmspace = obj_alloc(TYPE_VMSPACE, sizeof(struct vmspace));
         /* LAB 3 TODO END */
         BUG_ON(!vmspace);
 
         /* fixed PCID 1 for root process, PCID 0 is not used. */
         /* LAB 3 TODO BEGIN */
-
+        slot_id = VMSPACE_OBJ_ID;
         /* LAB 3 TODO END */
         BUG_ON(slot_id != VMSPACE_OBJ_ID);
         /* Set the cap_group_name (process_name) for easing debugging */

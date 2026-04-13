@@ -27,6 +27,7 @@
 #define BIT(x) (1ULL << (x))
 
 #define offsetof(TYPE, MEMBER) ((u64) & ((TYPE *)0)->MEMBER)
+// container_of: 已知一个成员地址，倒推出它属于哪个结构体对象
 #define container_of(ptr, type, field) \
         ((type *)((void *)(ptr) - (u64)(&(((type *)(0))->field))))
 
