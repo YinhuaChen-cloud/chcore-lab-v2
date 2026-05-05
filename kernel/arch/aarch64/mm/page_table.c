@@ -507,6 +507,8 @@ int unmap_range_in_pgtbl_huge(void *pgtbl, vaddr_t va, size_t len)
         /* LAB 2 TODO 4 END */
 }
 
+#define CHCORE_KERNEL_TEST
+
 #ifdef CHCORE_KERNEL_TEST
 #include <mm/buddy.h>
 #include <lab.h>
