@@ -993,6 +993,86 @@ npages = total_available_bytes / (PAGE_SIZE + sizeof(struct page))
 
 这样可以保证元数据数组和被管理页都放在同一段可用内存中，并且互不重叠。
 
+### 14.3 关键设计结论：元数据集中外置，不嵌入 free page
+
+针对“伙伴系统的元数据到底放在哪里”这个问题，ChCore 采用的是第一种设计：
+
+```text
+元数据集中存放在 page_metadata 数组里，
+buddy 真正管理和分配的是后面的 usable memory 区域。
+```
+
+也就是说，`struct page` 不会塞进空闲页自身的前几个字节里。初始化时，`mm_init` 把可用内存切成两段：
+
+```text
+低地址
+│
+│  集中元数据区                         对齐填充       buddy 可分配区
+│  page_metadata[]                      padding        usable memory
+│
+▼
++------------------------------------+-------------+--------------------------+
+| struct page[0..npages-1]           |   unused    |  4KB page | 4KB page | ... |
++------------------------------------+-------------+--------------------------+
+^                                                  ^
+|                                                  |
+page_meta_start                                   pool_start_addr
+                                                          ↑
+                                                          page_to_virt(page[0])
+```
+
+因此，对分配者来说，buddy 返回的每个页块都是完整的可用内存：
+
+```text
+buddy_get_pages(order=0)  →  返回 1 个完整 4KB 页
+buddy_get_pages(order=1)  →  返回 2 个物理上相邻的完整 4KB 页，即 8KB
+buddy_get_pages(order=2)  →  返回 4 个物理上相邻的完整 4KB 页，即 16KB
+```
+
+`kmalloc(0x1000)` 如果走到 buddy，得到的就是完整 `0x1000` 字节；`kmalloc(0x2000)` 得到的也是两个连续 4KB 页组成的完整 `0x2000` 字节。不会因为页内还要存 `struct page` 或链表节点而少掉一截可用空间。
+
+这一点可以从地址转换公式直接看出来：
+
+```c
+addr = (page - pool->page_metadata) * BUDDY_PAGE_SIZE
+        + pool->pool_start_addr;
+```
+
+`page - pool->page_metadata` 只是用集中元数据数组计算页号；真正返回给调用者的地址从 `pool_start_addr` 开始，而 `pool_start_addr` 已经位于元数据区之后。
+
+对比另一种“元数据内嵌到空闲页”的设计：
+
+```text
+不是 ChCore 的设计：
+
++-----------------------------+
+| free page                   |
+| ├── metadata / list node     |  ← 占用页内空间
+| └── remaining usable bytes   |
++-----------------------------+
+
+这种设计会让页本身的一部分空间被管理器占掉。
+```
+
+ChCore 的设计是：
+
+```text
+ChCore 的设计：
+
+metadata area                         usable page
++-----------------------------+       +-----------------------------+
+| struct page                  | ───▶  | full 4096 bytes for user    |
++-----------------------------+       +-----------------------------+
+```
+
+代价是：一开始必须从物理内存中拿出一段连续空间专门保存 `npages * sizeof(struct page)` 的元数据，所以 buddy 能管理的页数 `npages` 不是简单的 `total_bytes / 4KB`，而是：
+
+```text
+npages = total_available_bytes / (PAGE_SIZE + sizeof(struct page))
+```
+
+这表示“每管理一个 4KB 页，同时预留一个 `struct page` 的元数据空间”。但一旦某页进入 buddy 管理区，它对 `kmalloc` / `get_pages` 的使用者就是完整 4KB，且 order 大于 0 时返回的是物理上连续的完整页块。
+
 ---
 
 ## 15. `init_buddy`：逐页释放，自动合并成大块
