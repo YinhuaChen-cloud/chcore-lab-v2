@@ -62,19 +62,19 @@ struct phys_mem_pool {
 ## 2. 内存池整体布局（ASCII 图）
 
 ```
-低地址
-|
-|    page_metadata 区域               | 对齐填充 | 可用物理内存区域
-|  (npages * sizeof(struct page))     |  (pad)   |  (npages * 4KB)
-|                                     |          |
-v                                     v          v
-+-------------------------------------+----------+------------------...--+
-| page[0] | page[1] | ... | page[N-1] |   ...    |  4K页0 | 4K页1 | ...  |
-+-------------------------------------+----------+------------------...--+
-^                                                  ^
-|                                                  |
-page_metadata (free_mem_start)            pool_start_addr (start_addr)
-                                          = ROUND_UP(free_mem_start + npages*sizeof(page))
+                        低地址
+                        |
+                        |    page_metadata 区域               | 对齐填充 | 可用物理内存区域
+                        |  (npages * sizeof(struct page))     |  (pad)   |  (npages * 4KB)
+                        |                                     |          |
+                        v                                     v          v
+                        +-------------------------------------+----------+------------------...--+
+  0 ~ free_mem_start    | page[0] | page[1] | ... | page[N-1] |   ...    |  4K页0 | 4K页1 | ...  |
+is kernel .text & .data +-------------------------------------+----------+------------------...--+
+                        ^                                                ^
+                        |                                                |
+                        page_metadata (free_mem_start)            pool_start_addr (start_addr)
+                                                                    = ROUND_UP(free_mem_start + npages*sizeof(page))
 ```
 
 > 引自 `kernel/mm/mm.c:29-66`
