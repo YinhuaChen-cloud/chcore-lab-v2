@@ -234,7 +234,399 @@ After:
 
 ---
 
-## 4. SJTU-chcore 中的核心模型
+## 4. SJTU-chcore 如何把复杂功能放到用户态，同时保证内核安全
+
+前面讲的是 capability 与微内核的设计关系。本节进一步回答一个更具体的问题：
+
+> SJTU-chcore 到底如何把内存管理、文件系统、进程管理等复杂功能尽量放到用户态，让普通应用程序使用，同时还不破坏内核安全？
+
+先给出结论：**ChCore 的安全边界不是靠“用户态服务自觉不要乱来”，而是靠内核只暴露少量可验证的机制；复杂策略运行在用户态，但每次触碰内核对象时都必须提交 capability，由内核统一检查。**
+
+可以把整个系统理解成三层：
+
+```text
+普通应用程序
+    |
+    |  libc / libchcore API
+    v
+用户态系统服务
+    例如：进程管理器、文件系统服务、设备服务、网络服务
+    |
+    |  syscall + capability + PMO/IPC
+    v
+微内核
+    只负责：线程、地址空间、PMO、capability、异常/系统调用、基础调度
+```
+
+### 4.1 “复杂策略在用户态，基础机制在内核态”是什么意思
+
+宏内核里，文件系统、驱动、网络协议栈、进程管理策略等大量代码都在内核中运行。它们一旦出错，常常就是内核崩溃或任意内核内存破坏。
+
+微内核的思路是把系统拆成两类东西：
+
+```text
+机制 mechanism：
+    必须由内核掌控的最小能力。
+    例如：创建地址空间、切换线程、检查 capability、映射 PMO。
+
+策略 policy：
+    可以由普通用户态服务决定的复杂逻辑。
+    例如：哪个进程应该启动、文件路径如何解析、缓存如何替换、设备请求如何排队。
+```
+
+在 ChCore 中，这种拆分大致表现为：
+
+```text
+微内核保留：
+
+    - cap_group / capability table
+    - thread / scheduler 基础机制
+    - vmspace / page table 操作
+    - PMO 这种可授权的内存对象
+    - syscall 入口与参数检查
+    - copy_from_user / copy_to_user 这类用户态访问边界
+
+用户态服务负责：
+
+    - 创建和管理普通进程的策略
+    - 把 ELF、文件内容或请求数据组织成 PMO
+    - 通过 IPC 响应其它应用请求
+    - 决定是否把某个 capability 转交给另一个进程
+    - 文件系统、设备、网络等更复杂服务的业务逻辑
+```
+
+注意当前 SJTU-chcore lab 代码并没有完整实现真实文件系统和完整 IPC 子系统，很多服务只是在后续实验或完整 ChCore 中展开；但是当前代码已经把核心安全模型搭好了：**对象必须通过 capability 访问，跨进程资源共享必须通过 capability 复制或映射。**
+
+### 4.2 普通应用如何使用用户态系统服务
+
+一个应用程序并不应该直接知道磁盘驱动怎么工作，也不应该直接修改别的进程页表。它通常通过用户态库和系统服务间接完成复杂操作：
+
+```text
+Application
+    |
+    |  open/read/write/spawn 等高级 API，完整系统中由 libc 或系统库包装
+    v
+User-level server
+    |
+    |  用 syscall 操作 PMO、thread、cap_group 等内核对象
+    v
+Microkernel
+```
+
+以“读文件到用户缓冲区”为例，微内核风格的流程不是让文件系统代码跑进内核，而是让文件系统服务作为普通用户进程运行：
+
+```text
+App                         FS Server                         Kernel
+ |                              |                                |
+ | 1. 创建/准备 buffer PMO       |                                |
+ |----------------------------->|                                |
+ |   请求 read(file, buffer_cap) |                                |
+ |                              | 2. 检查请求、解析路径、读设备     |
+ |                              |    这些复杂逻辑在用户态完成       |
+ |                              |                                |
+ |                              | 3. 使用被授权的 PMO 写入数据      |
+ |                              |------------------------------->|
+ |                              |   sys_write_pmo(buffer_cap, ...) |
+ |                              |                                |
+ | 4. App 从 buffer 中看到数据    |                                |
+```
+
+这里最重要的是：FS Server 并不是“天然能访问 App 的内存”。它必须拿到 App 显式转交的 PMO capability，才能读写这块共享缓冲区。
+
+### 4.3 安全边界一：用户态服务仍然只是普通用户进程
+
+把文件系统或进程管理器放到用户态，并不意味着它们可以任意操作内核。
+
+它们和普通应用一样运行在 EL0：
+
+```text
+EL0 用户态：
+
+    App process
+    FS server
+    Process manager
+    Network server
+    Driver-like user service
+
+EL1 内核态：
+
+    Microkernel
+```
+
+因此用户态服务天然受到硬件隔离：
+
+```text
+用户态服务不能直接：
+
+    - 写内核内存
+    - 修改页表
+    - 伪造 struct object
+    - 伪造 object_slot
+    - 修改别的进程 cap_group
+    - 直接访问别的进程地址空间
+```
+
+它只能通过系统调用请求内核代为执行操作。而每个系统调用都会重新回到内核的检查逻辑。
+
+### 4.4 安全边界二：系统调用入口只接受 capability，不接受裸对象指针
+
+ChCore 的很多系统调用都不让用户态传内核对象指针，而是传 capability 编号。
+
+例如内存映射：
+
+```text
+sys_map_pmo(target_cap_group_cap, pmo_cap, addr, perm, len)
+```
+
+这个接口不会说“请给我一个 `struct pmobject *`”。用户态根本拿不到这个指针。它只能传：
+
+```text
+target_cap_group_cap：我是否有权操作目标进程？
+pmo_cap：我是否有权使用这段 PMO？
+```
+
+内核侧再调用：
+
+```text
+obj_get(current_cap_group, pmo_cap, TYPE_PMO)
+obj_get(current_cap_group, target_cap_group_cap, TYPE_CAP_GROUP)
+```
+
+这一步同时完成两类检查：
+
+```text
+1. capability 是否存在？
+2. capability 指向的对象类型是否正确？
+```
+
+所以，即使一个恶意用户态服务猜到某个整数，也不能绕过当前进程的 `cap_group`：
+
+```text
+Malicious Server
+    |
+    | sys_map_pmo(guess_cap, guess_pmo, ...)
+    v
+Kernel
+    |
+    | 在 Malicious Server 自己的 cap_group 中查 guess_cap / guess_pmo
+    | 查不到或类型不对：-ECAPBILITY
+```
+
+### 4.5 安全边界三：跨进程共享必须显式转交 capability
+
+用户态服务要给其它进程提供功能，通常需要共享某些对象。ChCore 不鼓励通过“全局名字 + 隐式权限”来共享，而是通过 capability 复制或移动。
+
+典型模型如下：
+
+```text
+App cap_group                       FS Server cap_group
+
+cap 5 -> buffer PMO                 cap 3 -> FS internal object
+
+App 请求 FS 读文件，并把 cap 5 转交给 FS：
+
+App cap_group                       FS Server cap_group
+
+cap 5 --------+                     cap 9 --------+
+              |                                    |
+              +------------> buffer PMO <----------+
+```
+
+在源码层面，这类动作由这些函数支撑：
+
+```text
+cap_copy(src_cap_group, dest_cap_group, src_slot_id)
+cap_move(src_cap_group, dest_cap_group, src_slot_id)
+sys_cap_copy_to(dest_cap_group_cap, src_slot_id)
+sys_cap_copy_from(src_cap_group_cap, src_slot_id)
+sys_transfer_caps(dest_group_cap, src_caps_buf, nr_caps, dst_caps_buf)
+```
+
+因此，“授权 FS Server 写入我的 buffer”不是靠 FS Server 知道我的虚拟地址，而是靠 App 把 PMO capability 交给 FS Server。
+
+### 4.6 安全边界四：共享内存用 PMO 表达，而不是暴露任意地址空间
+
+用户态服务之间需要高效传输数据时，不能简单把一个进程的裸虚拟地址交给另一个进程。虚拟地址只在各自 `vmspace` 中有意义，而且直接共享地址空间会破坏隔离。
+
+ChCore 使用 PMO 作为共享内存对象：
+
+```text
+PMO = Physical Memory Object
+
+    - 是一个内核对象
+    - 有自己的 capability
+    - 可以被映射到一个或多个进程的 vmspace
+    - 映射时可指定权限：读 / 写 / 执行
+```
+
+共享流程可以画成：
+
+```text
+         PMO object
+        /          \
+       /            \
+      v              v
+App vmspace      Server vmspace
+addr A           addr B
+
+同一个 PMO 可以映射到不同进程的不同虚拟地址。
+两个进程看到的虚拟地址不同，但背后是同一个内存对象。
+```
+
+源码里，用户态库提供了 PMO 包装接口：
+
+```text
+chcore_pmo_create(size, type)
+chcore_pmo_map(target_cap_group_cap, pmo_cap, addr, perm)
+chcore_pmo_write(pmo_cap, offset, buf, len)
+chcore_pmo_read(pmo_cap, offset, buf, len)
+chcore_pmo_auto_map(pmo_cap, size, perm)
+```
+
+内核侧则由 `sys_create_pmo()`、`sys_map_pmo()`、`sys_write_pmo()`、`sys_read_pmo()` 等系统调用实现。
+
+这使用户态服务能够高效传输大块数据，同时仍由内核检查：
+
+```text
+是否持有 PMO capability？
+是否持有目标 cap_group capability？
+映射权限是否合法？
+映射范围是否合法？
+```
+
+### 4.7 以“进程管理器创建应用”为例
+
+完整微内核系统中，进程管理器通常是用户态服务。它负责决定创建哪些进程、加载哪些程序、给新进程哪些初始资源。
+
+在 ChCore 的 capability 模型里，可以把流程理解为：
+
+```text
+Process Manager
+    |
+    | 1. 请求内核创建 cap_group
+    v
+Kernel
+    |
+    | 返回 new_process_cap_group_cap
+    v
+Process Manager
+    |
+    | 2. 创建 PMO，装入 ELF 代码/数据
+    | 3. sys_map_pmo(new_process_cap_group_cap, code_pmo_cap, ...)
+    | 4. sys_create_thread(new_process_cap_group_cap, entry, stack, ...)
+    v
+New Process
+```
+
+安全点在于：进程管理器不是直接改内核调度队列或目标页表，而是通过 capability 调用内核机制：
+
+```text
+创建进程：必须有创建 cap_group 的授权
+映射内存：必须同时有 PMO cap 和目标 cap_group cap
+创建线程：必须持有目标 cap_group cap
+传递初始资源：必须通过 cap_copy / transfer_caps
+```
+
+当前 lab 中 `sys_create_cap_group()` 还限制为只有 `ROOT_PID` 可以调用，这可以理解成教学版的“只有根服务 / 进程管理器可以创建新进程”。
+
+### 4.8 以“文件系统服务”为例
+
+当前 lab 尚未实现完整文件系统，但 capability 机制已经能解释完整 ChCore 或类似微内核中 FS Server 的安全模型。
+
+假设应用想读文件：
+
+```text
+App:
+    1. 创建 buffer PMO
+    2. 把 buffer PMO capability 随请求发给 FS Server
+    3. 等待 FS Server 返回
+
+FS Server:
+    1. 收到请求和 buffer PMO capability
+    2. 在用户态完成路径解析、权限策略、缓存逻辑
+    3. 通过 PMO 写入数据
+    4. 返回结果
+
+Kernel:
+    1. 只负责检查 capability 是否真实存在
+    2. 只负责 PMO 映射/读写/传递等基础机制
+    3. 不需要理解复杂文件系统逻辑
+```
+
+对应的安全性质是：
+
+```text
+FS Server 出 bug 时：
+
+    - 可能破坏自己的用户态地址空间
+    - 可能返回错误文件内容
+    - 可能错误处理自己已经持有的 capability
+
+但它不能直接：
+
+    - 写任意内核内存
+    - 修改 App 未授权的 PMO
+    - 操作它没有 capability 的进程
+    - 随意伪造其它对象 capability
+```
+
+这就是“把复杂功能放到用户态还能保证内核安全”的核心。
+
+### 4.9 内核安全性来自哪些源码机制
+
+回到 SJTU-chcore 源码，可以把安全性归纳为五个机制：
+
+```text
+1. 硬件特权级隔离
+   用户服务在 EL0，内核在 EL1。
+
+2. 每个进程独立 cap_group
+   capability 编号只在自己的 slot_table 中解释。
+
+3. 系统调用中使用 obj_get() 做对象查找和类型检查
+   错误 capability 返回 -ECAPBILITY。
+
+4. PMO / VMSpace / Thread / CapGroup 都是 object
+   内核统一维护 refcount、copies_head 和对象释放流程。
+
+5. 跨进程资源共享必须调用 cap_copy() / sys_transfer_caps() / sys_map_pmo()
+   授权关系由内核建立，而不是用户态自己写内核表。
+```
+
+可以用一张总图总结：
+
+```text
+                    +-----------------------------+
+                    |        Microkernel          |
+                    |-----------------------------|
+                    | object / capability checks  |
+                    | PMO mapping                 |
+                    | thread + vmspace mechanism  |
+                    | syscall boundary            |
+                    +--------------+--------------+
+                                   ^
+                                   |
+                    syscall(cap numbers only)
+                                   |
+        +--------------------------+--------------------------+
+        |                                                     |
+        v                                                     v
++-------------------+                               +-------------------+
+| User App          |     IPC / shared PMO / caps    | User FS Server    |
+|-------------------| <---------------------------> |-------------------|
+| own cap_group     |                               | own cap_group     |
+| own vmspace       |                               | own vmspace       |
+| no kernel pointer |                               | no kernel pointer |
++-------------------+                               +-------------------+
+```
+
+### 4.10 一句话总结这一节
+
+SJTU-chcore 的微内核安全思路是：**把文件系统、进程管理、设备服务等复杂策略放到用户态；内核只提供对象、capability、PMO、地址空间和线程等基础机制；用户态服务每次想操作资源，都必须通过 capability 让内核验证它是否真的被授权。**
+
+---
+
+## 5. SJTU-chcore 中的核心模型
 
 SJTU-chcore 的 capability 模型可以用一张图概括：
 
@@ -302,7 +694,7 @@ cap_group -> slot_table -> object_slot -> object -> real kernel object
 
 ---
 
-## 5. 内核对象：`struct object`
+## 6. 内核对象：`struct object`
 
 SJTU-chcore 把 capability 能指向的资源统一抽象为 `struct object`。定义在 [`kernel/include/object/object.h`](../kernel/include/object/object.h)：
 
@@ -326,7 +718,7 @@ TYPE_VMSPACE     虚拟地址空间
 TYPE_SEMAPHORE   信号量，后续实验使用
 ```
 
-### 5.1 为什么需要统一 object 头
+### 6.1 为什么需要统一 object 头
 
 统一对象头让 capability 子系统可以用同一套逻辑管理不同资源：
 
@@ -360,7 +752,7 @@ capability.c 只需要知道：
 
 ---
 
-## 6. capability slot：`struct object_slot`
+## 7. capability slot：`struct object_slot`
 
 `struct object_slot` 定义在 [`kernel/include/object/cap_group.h`](../kernel/include/object/cap_group.h)：
 
@@ -392,7 +784,7 @@ struct object_slot
            }
 ```
 
-### 6.1 `rights` 字段
+### 7.1 `rights` 字段
 
 `object_slot` 中有 `rights` 字段，表示 capability 可以携带权限位。完整 capability 系统通常会用它表达读、写、执行、转授权等权限。
 
@@ -400,7 +792,7 @@ struct object_slot
 
 ---
 
-## 7. `cap_group`：进程就是 capability 空间
+## 8. `cap_group`：进程就是 capability 空间
 
 `struct cap_group` 也定义在 [`kernel/include/object/cap_group.h`](../kernel/include/object/cap_group.h)。在 SJTU-chcore 中，它基本就是“进程”的核心抽象：
 
@@ -433,7 +825,7 @@ ChCore process / cap_group
     +---------------------------------------------------+
 ```
 
-### 7.1 两个固定 capability
+### 8.1 两个固定 capability
 
 SJTU-chcore 约定每个 `cap_group` 中：
 
@@ -456,7 +848,7 @@ slot 1: 我的地址空间是什么？
 
 ---
 
-## 8. slot table：capability 编号从哪里来
+## 9. slot table：capability 编号从哪里来
 
 每个 `cap_group` 内部有一个 `slot_table`：
 
@@ -494,11 +886,11 @@ slots[]:
 
 ---
 
-## 9. capability 生命周期
+## 10. capability 生命周期
 
 下面按典型生命周期理解 [`kernel/object/capability.c`](../kernel/object/capability.c)。
 
-### 9.1 创建对象：`obj_alloc()`
+### 10.1 创建对象：`obj_alloc()`
 
 `obj_alloc(type, size)` 做三件事：
 
@@ -525,7 +917,7 @@ obj_alloc(TYPE_PMO, sizeof(struct pmobject))
 
 注意：`obj_alloc()` 只创建对象，不自动创建 capability。因此对象刚分配出来时 `refcount = 0`。
 
-### 9.2 安装 capability：`cap_alloc()`
+### 10.2 安装 capability：`cap_alloc()`
 
 `cap_alloc(cap_group, obj, rights)` 把一个对象安装进某个 `cap_group` 的 slot table 中。
 
@@ -566,7 +958,7 @@ cap_group.slot_table.slots[slot_id]
     real object data
 ```
 
-### 9.3 使用 capability：`obj_get()` / `get_opaque()`
+### 10.3 使用 capability：`obj_get()` / `get_opaque()`
 
 大多数系统调用不会直接相信用户传进来的整数，而会用 `obj_get()` 把 capability 转成内核对象指针。
 
@@ -609,7 +1001,7 @@ object(type = TYPE_PMO)
 pmobject *
 ```
 
-### 9.4 释放引用：`obj_put()`
+### 10.4 释放引用：`obj_put()`
 
 `obj_get()` 会增加对象引用计数，所以用完后要 `obj_put()`。
 
@@ -620,7 +1012,7 @@ obj_put()  -> refcount - 1
 
 当引用计数变为 0 时，`obj_put()` 会调用 `__free_object()` 释放对象。
 
-### 9.5 复制 capability：`cap_copy()`
+### 10.5 复制 capability：`cap_copy()`
 
 `cap_copy(src_cap_group, dest_cap_group, src_slot_id)` 把源进程中的某个 capability 复制到目标进程。
 
@@ -655,7 +1047,7 @@ object_slot A                    object_slot B
 
 `object->copies_head` 会链接所有指向该对象的 `object_slot`。这让内核可以知道“有哪些 capability 正在指向这个对象”。
 
-### 9.6 移动 capability：`cap_move()`
+### 10.6 移动 capability：`cap_move()`
 
 `cap_move()` 可以理解为：
 
@@ -668,7 +1060,7 @@ cap_move(src, dest, cap)
 
 也就是把 capability 从源 `cap_group` 转移到目标 `cap_group`。
 
-### 9.7 释放 capability：`cap_free()`
+### 10.7 释放 capability：`cap_free()`
 
 `cap_free()` 删除一个 slot，并减少对象引用计数：
 
@@ -685,7 +1077,7 @@ cap_free(cap_group, slot_id)
 
 ---
 
-## 10. 创建进程：`cap_group` 也是对象
+## 11. 创建进程：`cap_group` 也是对象
 
 SJTU-chcore 有一个很重要的设计：**`cap_group` 本身也是 capability 指向的内核对象。**
 
@@ -702,7 +1094,7 @@ Then A can call:
     sys_map_pmo(4, 5, addr, perm, len)
 ```
 
-### 10.1 root 进程创建第一个 `cap_group`
+### 11.1 root 进程创建第一个 `cap_group`
 
 [`kernel/object/cap_group.c`](../kernel/object/cap_group.c) 中的 `create_root_cap_group()` 用于创建第一个用户进程的 `cap_group`。
 
@@ -727,7 +1119,7 @@ root_cap_group
     slot 1 -> root vmspace object
 ```
 
-### 10.2 普通创建：`sys_create_cap_group()`
+### 11.2 普通创建：`sys_create_cap_group()`
 
 `sys_create_cap_group()` 是用户态创建新 `cap_group` 的系统调用。
 
@@ -770,7 +1162,7 @@ slot N ---------------------------------> cap_group object <--- slot 0
 
 ---
 
-## 11. 创建线程：线程也是对象
+## 12. 创建线程：线程也是对象
 
 线程对象类型是 `TYPE_THREAD`。创建线程时，SJTU-chcore 会为线程分配一个 capability。
 
@@ -813,11 +1205,11 @@ obj_get(current_cap_group, args.cap_group_cap, TYPE_CAP_GROUP)
 
 ---
 
-## 12. 内存对象 PMO：用 capability 映射内存
+## 13. 内存对象 PMO：用 capability 映射内存
 
 PMO 是 physical memory object，表示一段物理内存对象。它是 SJTU-chcore 中理解 capability 很好的例子。
 
-### 12.1 创建 PMO
+### 13.1 创建 PMO
 
 [`kernel/object/memory.c`](../kernel/object/memory.c) 中 `create_pmo()` 的核心流程是：
 
@@ -836,7 +1228,7 @@ Process A
 slot 5 -> PMO object
 ```
 
-### 12.2 映射 PMO：`sys_map_pmo()`
+### 13.2 映射 PMO：`sys_map_pmo()`
 
 `sys_map_pmo(target_cap_group_cap, pmo_cap, addr, perm, len)` 是 capability 设计的典型体现。
 
@@ -906,7 +1298,7 @@ cap 5 ----+                       cap k ----+
 
 ---
 
-## 13. 用户态 API 到内核 syscall 的路径
+## 14. 用户态 API 到内核 syscall 的路径
 
 用户态 API 在 [`libchcore/src/capability/capability.c`](../libchcore/src/capability/capability.c)：
 
@@ -925,7 +1317,7 @@ SYS_cap_copy_from   -> sys_cap_copy_from
 SYS_transfer_caps   -> sys_transfer_caps
 ```
 
-### 13.1 `sys_cap_copy_to()`
+### 14.1 `sys_cap_copy_to()`
 
 语义：把当前进程的某个 capability 复制到目标 `cap_group`。
 
@@ -941,7 +1333,7 @@ sys_cap_copy_to(dest_cap_group_cap, src_slot_id)
 
 调用者必须持有目标 `cap_group` 的 capability，否则无法向目标进程复制能力。
 
-### 13.2 `sys_cap_copy_from()`
+### 14.2 `sys_cap_copy_from()`
 
 语义：从某个源 `cap_group` 中复制 capability 到当前进程。
 
@@ -957,7 +1349,7 @@ sys_cap_copy_from(src_cap_group_cap, src_slot_id)
 
 调用者必须持有源 `cap_group` 的 capability。
 
-### 13.3 `sys_transfer_caps()`
+### 14.3 `sys_transfer_caps()`
 
 `sys_transfer_caps()` 批量复制 capability。它从用户缓冲区读入一组源 capability，将它们复制到目标 `cap_group`，再把目标中的新 capability 编号写回用户缓冲区。
 
@@ -975,7 +1367,7 @@ sys_transfer_caps(dest_group_cap, src_caps, 3, dst_caps)
 
 ---
 
-## 14. capability 与微内核交互的典型场景
+## 15. capability 与微内核交互的典型场景
 
 下面用一个抽象场景串起来：用户进程请求文件系统服务读取数据到一段内存。
 
@@ -1028,9 +1420,9 @@ Objects:
 
 ---
 
-## 15. 和普通指针、全局 ID、文件描述符的区别
+## 16. 和普通指针、全局 ID、文件描述符的区别
 
-### 15.1 capability vs 普通指针
+### 16.1 capability vs 普通指针
 
 ```text
 普通指针：
@@ -1045,7 +1437,7 @@ Capability：
 
 在 SJTU-chcore 中，真实对象指针只在内核中存在。用户态 capability 编号不能直接解引用。
 
-### 15.2 capability vs 全局对象 ID
+### 16.2 capability vs 全局对象 ID
 
 ```text
 全局 ID：
@@ -1061,7 +1453,7 @@ Capability：
 
 capability 更强调“持有即授权”，而不是“知道全局名字后再查权限”。
 
-### 15.3 capability vs Linux 文件描述符
+### 16.3 capability vs Linux 文件描述符
 
 二者非常相似，但 capability 更一般化：
 
@@ -1079,9 +1471,9 @@ ChCore capability：
 
 ---
 
-## 16. 阅读源码时的几个易混点
+## 17. 阅读源码时的几个易混点
 
-### 16.1 `cap_group` 既是“进程”，也是“对象”
+### 17.1 `cap_group` 既是“进程”，也是“对象”
 
 `cap_group` 表示一个进程的 capability 空间。但它自己也通过 `obj_alloc(TYPE_CAP_GROUP, ...)` 创建，因此也能被别的 capability 指向。
 
@@ -1095,7 +1487,7 @@ cap_group object
 
 这不是 bug，而是设计：每个进程都持有“指向自己”的 capability。
 
-### 16.2 slot 0 和 slot 1 是约定，不是随机分配
+### 17.2 slot 0 和 slot 1 是约定，不是随机分配
 
 `CAP_GROUP_OBJ_ID = 0`，`VMSPACE_OBJ_ID = 1`。创建 `cap_group` 时必须保证：
 
@@ -1106,7 +1498,7 @@ slot 1 -> vmspace
 
 否则线程初始化、地址空间切换、内存映射都会出问题。
 
-### 16.3 `obj_get()` 返回的是 `opaque`，不是 `struct object *`
+### 17.3 `obj_get()` 返回的是 `opaque`，不是 `struct object *`
 
 `obj_get()` 返回真实对象指针，例如：
 
@@ -1119,7 +1511,7 @@ TYPE_VMSPACE   -> struct vmspace *
 
 如果需要从真实对象指针回到对象头，源码使用 `container_of()`。
 
-### 16.4 `refcount` 同时受 capability 和临时引用影响
+### 17.4 `refcount` 同时受 capability 和临时引用影响
 
 对象引用计数不只表示“有多少 capability 指向它”。`obj_get()` 也会临时增加引用计数，`obj_put()` 再减少。
 
@@ -1129,7 +1521,7 @@ TYPE_VMSPACE   -> struct vmspace *
 refcount = capability slots 数量 + 当前内核临时引用数量
 ```
 
-### 16.5 当前 lab 的 capability 还不是完整工业级实现
+### 17.5 当前 lab 的 capability 还不是完整工业级实现
 
 SJTU-chcore lab 有不少教学留空和简化，例如：
 
@@ -1147,7 +1539,7 @@ capability 的完整设计理念
 
 ---
 
-## 17. 总结
+## 18. 总结
 
 可以用下面几句话概括 SJTU-chcore 的 capability 机制：
 
