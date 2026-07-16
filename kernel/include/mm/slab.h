@@ -21,15 +21,25 @@
 #define SLAB_MAX_ORDER (11)
 
 typedef struct slab_header slab_header_t;
+/*
+ * 每个 slab 内存块开头的元数据。
+ * 一个 slab 管理一批固定大小（2^order 字节）的对象槽位，
+ * 并通过 free_list_head 记录本 slab 内还没分配出去的槽位链表。
+ */
 struct slab_header {
-        void *free_list_head;
-        slab_header_t *next_slab;
-        int order;
+        void *free_list_head;      /* 指向本 slab 中第一个空闲槽位 */
+        slab_header_t *next_slab;  /* 串起同一 order 的下一个 slab */
+        int order;                 /* 本 slab 中每个槽位的大小为 2^order 字节 */
 };
 
 typedef struct slab_slot_list slab_slot_list_t;
+/*
+ * 空闲槽位复用自身开头空间保存的链表节点。
+ * 只有槽位处于空闲状态时，该结构才有效；槽位分配给调用者后，
+ * 这片内存就是普通对象空间，不再保存 next_free 语义。
+ */
 struct slab_slot_list {
-        void *next_free;
+        void *next_free;           /* 指向同一 slab 中下一个空闲槽位 */
 };
 
 void init_slab(void);
