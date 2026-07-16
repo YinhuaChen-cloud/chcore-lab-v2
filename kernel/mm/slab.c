@@ -21,6 +21,11 @@
 slab_header_t *slabs[SLAB_MAX_ORDER + 1] = {NULL};
 
 /* local functions */
+/*
+ * 函数意图：把给定大小向上转换为 2 的幂次 order，使 2^order 能容纳 size。
+ * 参数：size 表示需要转换的字节数或数量。
+ * 返回值：返回最小的 order，满足 2^order >= size。
+ */
 static inline u64 size_to_order(u64 size)
 {
         u64 order = 0;
@@ -36,11 +41,21 @@ static inline u64 size_to_order(u64 size)
         return order;
 }
 
+/*
+ * 函数意图：把 order 转换为对应的 2 的幂大小。
+ * 参数：order 表示 2 的指数。
+ * 返回值：返回 2^order 对应的大小。
+ */
 static inline u64 order_to_size(u64 order)
 {
         return 1UL << order;
 }
 
+/*
+ * 函数意图：从 buddy 分配器申请一段连续页作为 slab 使用，并把这些页标记到同一个 slab。
+ * 参数：size 表示希望为 slab 申请的总字节数。
+ * 返回值：返回申请到的 slab 内存起始虚拟地址；失败时触发 BUG。
+ */
 static void *alloc_slab_memory(u64 size)
 {
         struct page *p_page, *page;
@@ -68,6 +83,11 @@ static void *alloc_slab_memory(u64 size)
         return addr;
 }
 
+/*
+ * 函数意图：初始化一个指定对象大小的 slab，把其中可用槽位串成空闲链表。
+ * 参数：order 表示单个 slab 对象的大小为 2^order 字节；size 表示该 slab 占用的总字节数。
+ * 返回值：返回新初始化的 slab 头部指针。
+ */
 static slab_header_t *init_slab_cache(int order, int size)
 {
         void *addr;
@@ -98,6 +118,11 @@ static slab_header_t *init_slab_cache(int order, int size)
         return slab;
 }
 
+/*
+ * 函数意图：在指定 order 的 slab 链表中取出一个空闲槽位；若没有空闲槽位则新建 slab。
+ * 参数：slab_header 表示当前 order 的 slab 链表头；order 表示要分配的槽位大小为 2^order 字节。
+ * 返回值：返回分配出的槽位起始地址，调用者可使用该槽位的完整 2^order 字节。
+ */
 static void *_alloc_in_slab_nolock(slab_header_t *slab_header, int order)
 {
         slab_slot_list_t *first_slot;
@@ -131,6 +156,11 @@ static void *_alloc_in_slab_nolock(slab_header_t *slab_header, int order)
         return _alloc_in_slab_nolock(new_slab, order);
 }
 
+/*
+ * 函数意图：封装 slab 内部的实际分配逻辑，当前版本不额外加锁。
+ * 参数：slab_header 表示当前 order 的 slab 链表头；order 表示要分配的槽位大小为 2^order 字节。
+ * 返回值：返回分配出的槽位起始地址。
+ */
 static void *_alloc_in_slab(slab_header_t *slab_header, int order)
 {
         void *free_slot;
@@ -143,6 +173,11 @@ static void *_alloc_in_slab(slab_header_t *slab_header, int order)
  * exported functions
  */
 
+/*
+ * 函数意图：初始化 slab 分配器，为支持的每个对象大小创建初始 slab。
+ * 参数：无。
+ * 返回值：无。
+ */
 void init_slab()
 {
         int order;
@@ -154,6 +189,11 @@ void init_slab()
         kdebug("mm: finish initing slab allocators\n");
 }
 
+/*
+ * 函数意图：按请求大小从 slab 分配器中分配一块小对象内存。
+ * 参数：size 表示调用者请求分配的字节数，必须不超过 slab 支持的最大对象大小。
+ * 返回值：返回可用内存的起始地址；实际槽位大小为不小于 size 的 2 的幂，且至少为 SLAB_MIN_ORDER 对应大小。
+ */
 void *alloc_in_slab(u64 size)
 {
         int order;
@@ -167,6 +207,11 @@ void *alloc_in_slab(u64 size)
         return _alloc_in_slab(slabs[order], order);
 }
 
+/*
+ * 函数意图：把之前由 slab 分配器分配出的槽位归还到所属 slab 的空闲链表。
+ * 参数：addr 表示要释放的槽位起始地址，必须是 slab 分配器返回过的地址。
+ * 返回值：无。
+ */
 void free_in_slab(void *addr)
 {
         struct page *page;
@@ -183,6 +228,11 @@ void free_in_slab(void *addr)
 }
 
 /* Get the size of free memory in slab */
+/*
+ * 函数意图：遍历所有 slab，统计当前 slab 分配器中仍处于空闲状态的内存总量。
+ * 参数：无。
+ * 返回值：返回所有空闲槽位大小之和，单位为字节。
+ */
 u64 get_free_mem_size_from_slab(void)
 {
         int order;
