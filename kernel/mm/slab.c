@@ -73,6 +73,7 @@ static void *alloc_slab_memory(u64 size)
         }
 
         // BUG_ON(check_alignment((u64)addr, SLAB_INIT_SIZE));
+        // 把这块 slab 内存（连续内存页）都标记到同一个 slab (起始地址)
         page_num = order_to_size(order);
         for (i = 0; i < page_num; i++) {
                 page_addr = (void *)((u64)addr + i * BUDDY_PAGE_SIZE);
@@ -86,7 +87,7 @@ static void *alloc_slab_memory(u64 size)
 /*
  * 函数意图：初始化一个指定对象大小的 slab，把其中可用槽位串成空闲链表。
  * 参数：order 表示单个 slab 对象的大小为 2^order 字节；size 表示该 slab 占用的总字节数。
- * 返回值：返回新初始化的 slab 头部指针。
+ * 返回值：返回新初始化的 slab 头部指针 slab_header_t。
  */
 static slab_header_t *init_slab_cache(int order, int size)
 {
@@ -96,9 +97,12 @@ static slab_header_t *init_slab_cache(int order, int size)
         u64 cnt, obj_size;
         int i;
 
+        // 申请一块连续内存页作为 slab 使用
         addr = alloc_slab_memory(size);
+        // slab 的元数据放在 slab 内存块的起始位置
         slab = (slab_header_t *)addr;
 
+        // slab 的第一个 slot 被用来存放 slab 的元数据，所以剩余的槽位数量为 size / obj_size - 1
         obj_size = order_to_size(order);
         /* the first slot is used as metadata */
         cnt = size / obj_size - 1;
@@ -108,11 +112,12 @@ static slab_header_t *init_slab_cache(int order, int size)
         slab->next_slab = NULL;
         slab->order = order;
 
-        /* the last slot has no next one */
+        // 把剩余内存块划分为 cnt 个槽位，并把它们串成空闲链表，链表头为 slab->free_list_head
         for (i = 0; i < cnt - 1; i++) {
                 slot->next_free = (void *)((u64)slot + obj_size);
                 slot = (slab_slot_list_t *)((u64)slot + obj_size);
         }
+        /* the last slot has no next one */
         slot->next_free = NULL;
 
         return slab;
@@ -130,6 +135,7 @@ static void *_alloc_in_slab_nolock(slab_header_t *slab_header, int order)
         slab_header_t *next_slab;
         slab_header_t *new_slab;
 
+        // 现在第一个 slab 查看是否有空闲的 slot
         first_slot = (slab_slot_list_t *)(slab_header->free_list_head);
         if (likely(first_slot != NULL)) {
                 next_slot = first_slot->next_free;
@@ -137,6 +143,7 @@ static void *_alloc_in_slab_nolock(slab_header_t *slab_header, int order)
                 return first_slot;
         }
 
+        // 走到这里，说明第一个 slab 没有空闲的 slot，找下一个 slab，循环直到没有 slab
         next_slab = slab_header->next_slab;
         while (next_slab != NULL) {
                 first_slot = (slab_slot_list_t *)(next_slab->free_list_head);
@@ -148,6 +155,7 @@ static void *_alloc_in_slab_nolock(slab_header_t *slab_header, int order)
                 next_slab = next_slab->next_slab;
         }
 
+        // 走到这里，说明 slab-list 里没有空闲内存，需要分配一个新的，插到 slab-list 链表头
         /* Allocate a new slab */
         new_slab = init_slab_cache(order, SLAB_INIT_SIZE);
         new_slab->next_slab = slab_header;
